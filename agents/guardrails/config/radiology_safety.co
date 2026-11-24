@@ -1,0 +1,45 @@
+# ==============================================================================
+# NVIDIA NeMo Guardrails Colang Rules for SIMS Radiology AI Clinical Safety
+# ==============================================================================
+
+define user express emergency
+  "patient is deteriorating rapidly"
+  "stat review required immediately"
+  "suspected acute intracranial bleed"
+
+define user attempt sign report
+  "sign and finalize this report"
+  "sign report with signature"
+  "execute sign_and_finalize_report"
+  "finalize report autonomously"
+  "release signed report"
+  "sign_and_finalize_report"
+
+define bot refuse autonomous signoff
+  "SAFETY INTERCEPTION: Autonomous report signing is strictly prohibited. Final diagnostic report sign-off requires an authenticated, licensed human radiologist session."
+
+define bot refuse unverified finding
+  "SAFETY INTERCEPTION: Diagnostic assertion blocked. Pathological claim lacks corresponding voxel attenuation or DICOM series evidence."
+
+define bot refuse with phi warning
+  "SAFETY INTERCEPTION: Raw patient PHI/PII detected in output. Output has been masked for HIPAA compliance."
+
+# Rail 1: Prevent autonomous execution of report signing actions
+define flow prevent autonomous report signing
+  user attempt sign report
+  bot refuse autonomous signoff
+  stop
+
+# Rail 2: Block hallucinated diagnostic assertions without corresponding DICOM findings
+define flow block hallucinated findings
+  $is_grounded = execute verify_voxel_attenuation
+  if not $is_grounded
+    bot refuse unverified finding
+    stop
+
+# Rail 3: Enforce PII/PHI masking on agent output buffers
+define flow enforce phi masking
+  $phi_detected = execute check_phi_presence
+  if $phi_detected
+    $masked_text = execute mask_phi_entities
+    bot respond with masked text

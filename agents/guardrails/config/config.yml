@@ -1,0 +1,25 @@
+# NVIDIA NeMo Guardrails Configuration for Radiology AI Clinical Safety
+models:
+  - type: main
+    engine: openai
+    model: gpt-4o
+
+rails:
+  input:
+    flows:
+      - prevent autonomous report signing
+
+  output:
+    flows:
+      - block hallucinated findings
+      - enforce phi masking
+
+prompts:
+  - task: self_check_hallucination
+    content: |-
+      You are a clinical radiology verification model.
+      Verify if the proposed findings correlate strictly with the evidence in the DICOM series.
+      Clinical text: {{ bot_response }}
+      DICOM findings: {{ context }}
+      Does the report mention abnormalities that are completely unsupported by the imaging evidence?
+      Answer YES or NO.

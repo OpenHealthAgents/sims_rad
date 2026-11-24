@@ -1,0 +1,124 @@
+# SIMS Radiology Platform - Docker Compose Stack
+# Located in docker/
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: sims_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-sims_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-sims_secret_password}
+      POSTGRES_DB: ${POSTGRES_DB:-sims_radiology}
+    ports:
+      - "${POSTGRES_HOST_PORT:-5433}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - sims_network
+
+  redis:
+    image: redis:7-alpine
+    container_name: sims_redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - sims_network
+
+  kestra:
+    image: kestra/kestra:latest
+    container_name: sims_kestra
+    restart: unless-stopped
+    command: server standalone
+    ports:
+      - "8080:8080"
+    volumes:
+      - kestra_data:/app/storage
+      - ../kestra/flows:/app/flows
+    environment:
+      KESTRA_CONFIGURATION: |
+        kestra:
+          storage:
+            type: local
+            local:
+              base-path: "/app/storage"
+          repository:
+            type: memory
+          queue:
+            type: memory
+    networks:
+      - sims_network
+
+  langfuse:
+    image: langfuse/langfuse:latest
+    container_name: sims_langfuse
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      DATABASE_URL: "postgresql://${POSTGRES_USER:-sims_user}:${POSTGRES_PASSWORD:-sims_secret_password}@postgres:5432/${POSTGRES_DB:-sims_radiology}"
+      NEXTAUTH_SECRET: "sims_nextauth_secret_dev_32char_minimum"
+      SALT: "sims_salt_key_radiology_dev"
+      ENCRYPTION_KEY: "0000000000000000000000000000000000000000000000000000000000000000"
+      NEXTAUTH_URL: "http://localhost:3000"
+      TELEMETRY_ENABLED: "false"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - sims_network
+
+  api:
+    build:
+      context: ..
+      dockerfile: apps/api/Dockerfile
+    container_name: sims_api
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      PROJECT_NAME: "${PROJECT_NAME:-SIMS Radiology AI Operating Agentic Platform}"
+      ENVIRONMENT: "${ENVIRONMENT:-development}"
+      API_V1_STR: "/api/v1"
+      POSTGRES_SERVER: "postgres"
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: "${POSTGRES_USER:-sims_user}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-sims_secret_password}"
+      POSTGRES_DB: "${POSTGRES_DB:-sims_radiology}"
+      REDIS_HOST: "redis"
+      REDIS_PORT: 6379
+      LANGFUSE_HOST: "http://langfuse:3000"
+      KESTRA_API_HOST: "http://kestra:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    networks:
+      - sims_network
+
+volumes:
+  postgres_data:
+  redis_data:
+  kestra_data:
+
+networks:
+  sims_network:
+    driver: bridge

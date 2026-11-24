@@ -1,0 +1,81 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --bg-main: #FAFCFD;
+    --card-surface: #FFFFFF;
+    --border-subtle: #E1E9F2;
+    --text-primary: #0B1C34;
+    --text-muted: #53657D;
+    --accent-teal: #00A6A6;
+    --accent-cyan: #2DC4DC;
+  }
+
+  .dark {
+    --bg-main: #071224;
+    --card-surface: #0B1C34;
+    --border-subtle: #18355E;
+    --text-primary: #FAFCFD;
+    --text-muted: #9BB0CD;
+    --accent-teal: #00A6A6;
+    --accent-cyan: #2DC4DC;
+  }
+
+  body {
+    font-family: 'Inter', system-ui, -apple-system, Arial, sans-serif;
+    transition: background-color 0.3s ease, color 0.3s ease;
+  }
+}
+
+/* Custom scrollbar */
+::-webkit-scrollbar {
+  width: 7px;
+  height: 7px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.dark ::-webkit-scrollbar-thumb {
+  background: #18355E;
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #CBD5E1;
+  border-radius: 4px;
+}
+
+/* Scanline animation */
+@keyframes scanline {
+  0% { transform: translateY(-100%); }
+  100% { transform: translateY(1000%); }
+}
+
+.animate-scanline {
+  animation: scanline 4.5s linear infinite;
+}
+
+/* Glassmorphism helpers */
+.glass-header-dark {
+  background: rgba(11, 28, 52, 0.88);
+  backdrop-filter: blur(14px);
+  border-bottom: 1px solid rgba(24, 53, 94, 0.85);
+}
+
+.glass-header-light {
+  background: rgba(250, 252, 253, 0.88);
+  backdrop-filter: blur(14px);
+  border-bottom: 1px solid rgba(225, 233, 242, 0.95);
+}
+
+.medical-card-hover {
+  transition: all 0.25s cubic-bezier(0.16, 1, 0.3, 1);
+}
+.medical-card-hover:hover {
+  transform: translateY(-3px);
+  border-color: #00A6A6;
+}

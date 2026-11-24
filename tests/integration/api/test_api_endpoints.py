@@ -1,0 +1,509 @@
+"""
+Integration Tests for SIMS Radiology REST API Endpoints.
+Verifies:
+1. RBAC authorization (Radiologist/Director sign-off succeeds; Resident fails with HTTP 403).
+2. Cryptographic signature generation on report finalization.
+3. Work-items listing, filtering, detail + Case Concierge AI summary.
+4. SHAP feature attribution explainability.
+5. Work-item assignment management and state machine transitions.
+6. Report drafting via Deep Agents assistant.
+7. Operational metrics (TAT, volume by modality, exception counts).
+8. Integrations health and Transactional Outbox backlog depth.
+9. OpenAPI schema validity and Correlation ID middleware.
+"""
+from datetime import datetime, timezone, timedelta
+import pytest
+from httpx import ASGITransport, AsyncClient
+
+from apps.api.middleware.auth import UserRole, create_access_token
+from apps.api.src.endpoints.integrations import (
+    IN_MEMORY_PATIENTS,
+    IN_MEMORY_STUDIES,
+    IN_MEMORY_WORK_ITEMS,
+)
+from apps.api.routes.reports import IN_MEMORY_REPORTS, seed_in_memory_report
+from apps.api.src.main import app
+from core.domain.entities.patient import Patient, ReconciliationStatus
+from core.domain.entities.study import Modality, RadiologyStudy
+from core.domain.entities.work_item import Priority, WorkItem, WorkItemState
+
+
+@pytest.fixture(autouse=True)
+def setup_worklist_data():
+    """Ensure in-memory mock repositories have fresh predictable data for API tests."""
+    IN_MEMORY_PATIENTS.clear()
+    IN_MEMORY_STUDIES.clear()
+    IN_MEMORY_WORK_ITEMS.clear()
+    IN_MEMORY_REPORTS.clear()
+
+    now = datetime.now(timezone.utc)
+
+    # Seed Patient
+    patient = Patient(
+        patient_id="PAT-001",
+        mrn="MRN-1001",
+        identifier_namespace="urn:oid:sims.hospital.patients",
+        reconciliation_status=ReconciliationStatus.RECONCILED,
+    )
+    IN_MEMORY_PATIENTS["PAT-001"] = patient
+
+    # Seed Study 1 (CT) & WorkItem 1 (READY)
+    study_1 = RadiologyStudy(
+        study_id="STUDY-001",
+        study_instance_uid="1.2.840.10008.5.1.4.1.1.2.20261124.001",
+        accession_number="ACC-001",
+        modality=Modality.CT,
+        study_date=now,
+        source_system="PACS_ORTHANC",
+        patient_id="PAT-001",
+    )
+    wi_1 = WorkItem(
+        work_item_id="WI-001",
+        study_id="STUDY-001",
+        state=WorkItemState.READY,
+        priority=Priority.STAT,
+        assigned_radiologist_id=None,
+        sla_deadline=now + timedelta(hours=1),
+        version=1,
+    )
+    IN_MEMORY_STUDIES["STUDY-001"] = study_1
+    IN_MEMORY_WORK_ITEMS["WI-001"] = wi_1
+
+    # Seed Study 2 (XRAY) & WorkItem 2 (ASSIGNED)
+    study_2 = RadiologyStudy(
+        study_id="STUDY-002",
+        study_instance_uid="1.2.840.10008.5.1.4.1.1.2.20261124.002",
+        accession_number="ACC-002",
+        modality=Modality.XRAY,
+        study_date=now,
+        source_system="PACS_ORTHANC",
+        patient_id="PAT-001",
+    )
+    wi_2 = WorkItem(
+        work_item_id="WI-002",
+        study_id="STUDY-002",
+        state=WorkItemState.ASSIGNED,
+        priority=Priority.URGENT,
+        assigned_radiologist_id="RAD-002",
+        sla_deadline=now + timedelta(hours=4),
+        version=1,
+    )
+    IN_MEMORY_STUDIES["STUDY-002"] = study_2
+    IN_MEMORY_WORK_ITEMS["WI-002"] = wi_2
+
+    # Seed Study 3 (MRI) & WorkItem 3 (RECEIVED)
+    study_3 = RadiologyStudy(
+        study_id="STUDY-003",
+        study_instance_uid="1.2.840.10008.5.1.4.1.1.2.20261124.003",
+        accession_number="ACC-003",
+        modality=Modality.MRI,
+        study_date=now,
+        source_system="PACS_ORTHANC",
+        patient_id="PAT-001",
+    )
+    wi_3 = WorkItem(
+        work_item_id="WI-003",
+        study_id="STUDY-003",
+        state=WorkItemState.RECEIVED,
+        priority=Priority.ROUTINE,
+        assigned_radiologist_id=None,
+        sla_deadline=now + timedelta(hours=24),
+        version=1,
+    )
+    IN_MEMORY_STUDIES["STUDY-003"] = study_3
+    IN_MEMORY_WORK_ITEMS["WI-003"] = wi_3
+
+    # Seed Baseline Reports
+    seed_in_memory_report("REP-001", "WI-001")
+    seed_in_memory_report("REP-002", "WI-002")
+
+
+def make_auth_headers(
+    user_id: str,
+    role: UserRole,
+    name: str = "Test Clinician",
+    license_number: str = "MED-LIC-998877",
+) -> dict:
+    """Generate standard Bearer Authorization headers with JWT token."""
+    token = create_access_token(
+        user_id=user_id,
+        role=role,
+        email=f"{user_id.lower()}@simsradiology.org",
+        name=name,
+        license_number=license_number,
+    )
+    return {
+        "Authorization": f"Bearer {token}",
+        "X-Correlation-Id": f"corr-test-{user_id.lower()}",
+    }
+
+
+# =============================================================================
+# 1. OpenAPI Schema Validity
+# =============================================================================
+
+def test_openapi_schema_validity():
+    """Verify OpenAPI schema generated by FastAPI contains all required routes."""
+    schema = app.openapi()
+    assert schema is not None
+    assert "paths" in schema
+    paths = schema["paths"]
+
+    # Verify key endpoints are defined in OpenAPI
+    expected_endpoints = [
+        "/api/v1/work-items",
+        "/api/v1/work-items/{work_item_id}",
+        "/api/v1/work-items/{work_item_id}/explainability",
+        "/api/v1/work-items/{work_item_id}/assignments",
+        "/api/v1/work-items/{work_item_id}/transitions",
+        "/api/v1/work-items/{work_item_id}/report-drafts",
+        "/api/v1/report-versions/{id}/finalize",
+        "/api/v1/metrics/radiology",
+        "/api/v1/integrations/health",
+    ]
+    for endpoint in expected_endpoints:
+        assert endpoint in paths, f"Expected endpoint '{endpoint}' not found in OpenAPI schema: {list(paths.keys())}"
+
+
+# =============================================================================
+# 2. Authentication & Authorization (RBAC) Enforcement
+# =============================================================================
+
+@pytest.mark.asyncio
+async def test_unauthenticated_request_returns_401():
+    """Unauthenticated access to protected routes must be rejected with HTTP 401."""
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        # Without Authorization header
+        res_work_items = await client.get("/api/v1/work-items")
+        assert res_work_items.status_code == 401
+        assert "Missing authentication credentials" in res_work_items.json()["detail"]
+
+        res_finalize = await client.post("/api/v1/report-versions/REP-001/finalize")
+        assert res_finalize.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_resident_signoff_forbidden_returns_403():
+    """
+    CRITICAL SAFETY REQUIREMENT:
+    Radiology Resident attempting to finalize/sign a report must be rejected with HTTP 403 Forbidden.
+    Only REPORTING_RADIOLOGIST or RADIOLOGY_DIRECTOR can finalize reports.
+    """
+    resident_headers = make_auth_headers(
+        user_id="RES-001",
+        role=UserRole.RADIOLOGY_RESIDENT,
+        name="Dr. Resident MD",
+    )
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        res = await client.post(
+            "/api/v1/report-versions/REP-001/finalize",
+            headers=resident_headers,
+            json={"attestation_statement": "Resident review complete."},
+        )
+        assert res.status_code == 403, f"Expected 403 Forbidden for Resident, got {res.status_code}: {res.text}"
+        data = res.json()
+        assert "Forbidden" in data["detail"]
+        assert "RADIOLOGY_RESIDENT" in data["detail"]
+
+
+@pytest.mark.asyncio
+async def test_radiographer_and_coordinator_signoff_forbidden_returns_403():
+    """Radiographer and Coordinator cannot sign off reports."""
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        # Radiographer
+        tech_headers = make_auth_headers(user_id="TECH-001", role=UserRole.RADIOGRAPHER)
+        res_tech = await client.post("/api/v1/report-versions/REP-001/finalize", headers=tech_headers)
+        assert res_tech.status_code == 403
+
+        # Coordinator
+        coord_headers = make_auth_headers(user_id="COORD-001", role=UserRole.COORDINATOR)
+        res_coord = await client.post("/api/v1/report-versions/REP-001/finalize", headers=coord_headers)
+        assert res_coord.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_reporting_radiologist_signoff_succeeds_with_crypto_signature():
+    """
+    Reporting Radiologist sign-off must succeed (HTTP 200) and generate
+    a SHA-256 cryptographic signature record.
+    """
+    rad_headers = make_auth_headers(
+        user_id="RAD-ATTENDING-01",
+        role=UserRole.REPORTING_RADIOLOGIST,
+        name="Dr. Sarah Jenkins MD",
+        license_number="LIC-RAD-NY-44821",
+    )
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        res = await client.post(
+            "/api/v1/report-versions/REP-001/finalize",
+            headers=rad_headers,
+            json={"attestation_statement": "Clinically reviewed and verified."},
+        )
+        assert res.status_code == 200, f"Expected 200 OK, got {res.status_code}: {res.text}"
+        data = res.json()
+        assert data["status"] == "SIGNED"
+        assert data["is_signed"] is True
+        assert len(data["signature_hash"]) == 64  # SHA-256 hex digest
+        assert data["signed_by"] == "Dr. Sarah Jenkins MD"
+        assert data["signer_role"] == "REPORTING_RADIOLOGIST"
+        assert data["license_number"] == "LIC-RAD-NY-44821"
+        assert data["report_id"] == "REP-001"
+
+
+@pytest.mark.asyncio
+async def test_radiology_director_signoff_succeeds():
+    """Radiology Director sign-off succeeds with role RADIOLOGY_DIRECTOR."""
+    dir_headers = make_auth_headers(
+        user_id="DIR-CHIEF-01",
+        role=UserRole.RADIOLOGY_DIRECTOR,
+        name="Dr. Marcus Vance MD",
+        license_number="LIC-DIR-CHIEF-001",
+    )
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        res = await client.post(
+            "/api/v1/report-versions/REP-002-v1/finalize",
+            headers=dir_headers,
+            json={"attestation_statement": "Department chief sign-off approved."},
+        )
+        assert res.status_code == 200
+        data = res.json()
+        assert data["status"] == "SIGNED"
+        assert data["signer_role"] == "RADIOLOGY_DIRECTOR"
+        assert len(data["signature_hash"]) == 64
+
+
+# =============================================================================
+# 3. Work-Items Querying, Pagination, and Case Concierge AI
+# =============================================================================
+
+@pytest.mark.asyncio
+async def test_get_work_items_listing_and_filtering():
+    """Test filtered, paginated worklist retrieval."""
+    auth_headers = make_auth_headers(user_id="RAD-001", role=UserRole.REPORTING_RADIOLOGIST)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        # Default listing
+        res = await client.get("/api/v1/work-items", headers=auth_headers)
+        assert res.status_code == 200
+        data = res.json()
+        assert "items" in data
+        assert "total_count" in data
+        assert data["total_count"] >= 1
+        assert len(data["items"]) >= 1
+
+        # Filter by Modality
+        res_ct = await client.get("/api/v1/work-items?modality=CT", headers=auth_headers)
+        assert res_ct.status_code == 200
+        data_ct = res_ct.json()
+        for item in data_ct["items"]:
+            assert item["modality"] == "CT"
+
+        # Filter by Priority
+        res_stat = await client.get("/api/v1/work-items?priority=STAT", headers=auth_headers)
+        assert res_stat.status_code == 200
+        for item in res_stat.json()["items"]:
+            assert item["priority"] == "STAT"
+
+
+@pytest.mark.asyncio
+async def test_get_work_item_detail_with_concierge_summary():
+    """Verify fetching single work-item provides rich detail and Case Concierge AI brief."""
+    auth_headers = make_auth_headers(user_id="RAD-001", role=UserRole.REPORTING_RADIOLOGIST)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        res = await client.get("/api/v1/work-items/WI-001", headers=auth_headers)
+        assert res.status_code == 200
+        data = res.json()
+        assert data["work_item_id"] == "WI-001"
+        assert data["modality"] == "CT"
+        assert "concierge_brief" in data
+        assert data["concierge_brief"] is not None
+        assert "referral_question" in data["concierge_brief"]
+        assert "patient_context_summary" in data["concierge_brief"]
+
+
+# =============================================================================
+# 4. Explainability: SHAP Feature Attribution
+# =============================================================================
+
+@pytest.mark.asyncio
+async def test_get_work_item_explainability_shap():
+    """Verify endpoint returns SHAP feature attribution metrics for SLA and priority risk."""
+    auth_headers = make_auth_headers(user_id="RAD-001", role=UserRole.REPORTING_RADIOLOGIST)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        res = await client.get("/api/v1/work-items/WI-001/explainability", headers=auth_headers)
+        assert res.status_code == 200
+        data = res.json()
+        assert data["work_item_id"] == "WI-001"
+        assert "base_expected_value" in data
+        assert "shap_feature_attributions" in data
+        assert "top_risk_drivers" in data
+        assert "all_factors_ranked" in data
+        assert len(data["all_factors_ranked"]) > 0
+        assert "operational_recommendation" in data
+
+
+# =============================================================================
+# 5. Assignment Management & Workflow State Machine Transitions
+# =============================================================================
+
+@pytest.mark.asyncio
+async def test_assign_work_item():
+    """Coordinator or Director assigns work-item with justification reason code."""
+    coord_headers = make_auth_headers(user_id="COORD-001", role=UserRole.COORDINATOR)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        payload = {
+            "assigned_radiologist_id": "RAD-NEURO-SPEC",
+            "reason_code": "SUB_SPECIALTY_MATCH",
+            "notes": "Assigned to Neuroradiology specialist for acute trauma reading.",
+        }
+        res = await client.post(
+            "/api/v1/work-items/WI-001/assignments",
+            headers=coord_headers,
+            json=payload,
+        )
+        assert res.status_code == 200
+        data = res.json()
+        assert data["assigned_radiologist_id"] == "RAD-NEURO-SPEC"
+        assert data["state"] == WorkItemState.ASSIGNED.value
+
+
+@pytest.mark.asyncio
+async def test_workflow_state_transition():
+    """Radiologist transitions work-item through valid state path."""
+    rad_headers = make_auth_headers(user_id="RAD-001", role=UserRole.REPORTING_RADIOLOGIST)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        # WI-002 is in ASSIGNED state -> transition to IN_PROGRESS
+        res = await client.post(
+            "/api/v1/work-items/WI-002/transitions",
+            headers=rad_headers,
+            json={"target_state": "IN_PROGRESS", "reason": "Began image slice reading."},
+        )
+        assert res.status_code == 200
+        data = res.json()
+        assert data["state"] == WorkItemState.IN_PROGRESS.value
+        assert data["version"] >= 2
+
+
+@pytest.mark.asyncio
+async def test_invalid_state_transition_fails():
+    """State transition violating state machine invariants returns HTTP 400."""
+    rad_headers = make_auth_headers(user_id="RAD-001", role=UserRole.REPORTING_RADIOLOGIST)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        # Attempt illegal jump: RECEIVED -> FINALIZED without review
+        res = await client.post(
+            "/api/v1/work-items/WI-003/transitions",
+            headers=rad_headers,
+            json={"target_state": "FINALIZED", "reason": "Attempted shortcut."},
+        )
+        assert res.status_code == 400
+        assert "Invalid state transition" in res.json()["detail"]
+
+
+# =============================================================================
+# 6. AI Agent Report Drafting
+# =============================================================================
+
+@pytest.mark.asyncio
+async def test_create_report_draft_with_agent_assistant():
+    """Clinician creates structured draft using AI assistant."""
+    resident_headers = make_auth_headers(user_id="RES-001", role=UserRole.RADIOLOGY_RESIDENT)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        payload = {
+            "findings": "Right middle lobe focal alveolar opacity without pleural effusion.",
+            "impression": "Right middle lobe pneumonia. Recommend correlation with clinical symptoms.",
+            "clinical_indication": "Fever, productive cough, pleuritic chest pain.",
+        }
+        res = await client.post(
+            "/api/v1/work-items/WI-002/report-drafts",
+            headers=resident_headers,
+            json=payload,
+        )
+        assert res.status_code in (200, 201)
+        data = res.json()
+        assert data["status"] == "DRAFT"
+        assert data["is_signed"] is False
+        assert "structured_findings" in data
+        assert data["author_id"] in ("RES-001", "SIMS_AI_CONCIERGE_AGENT")
+
+
+# =============================================================================
+# 7. Radiology Operational Telemetry & Metrics
+# =============================================================================
+
+@pytest.mark.asyncio
+async def test_radiology_metrics_telemetry():
+    """Retrieve operational telemetry including TAT, modality breakdown, and exceptions."""
+    rad_headers = make_auth_headers(user_id="RAD-001", role=UserRole.REPORTING_RADIOLOGIST)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        res = await client.get("/api/v1/metrics/radiology?timeframe_hours=24", headers=rad_headers)
+        assert res.status_code == 200
+        data = res.json()
+        assert data["total_work_items"] >= 3
+        assert data["average_turnaround_time_minutes"] > 0
+        assert "volume_by_modality" in data
+        assert data["volume_by_modality"]["CT"] >= 1
+        assert data["volume_by_modality"]["MRI"] >= 1
+        assert data["volume_by_modality"]["XRAY"] >= 1
+        assert "volume_by_priority" in data
+        assert data["volume_by_priority"]["STAT"] >= 1
+        assert "exception_count" in data
+        assert data["sla_compliance_rate_percent"] >= 0.0
+
+
+# =============================================================================
+# 8. External Integrations Health & Outbox Backlog Depth
+# =============================================================================
+
+@pytest.mark.asyncio
+async def test_integrations_health_and_outbox_metrics():
+    """Verify external connector health statuses and outbox backlog depth."""
+    rad_headers = make_auth_headers(user_id="RAD-001", role=UserRole.REPORTING_RADIOLOGIST)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        res = await client.get("/api/v1/integrations/health", headers=rad_headers)
+        assert res.status_code == 200
+        data = res.json()
+        assert data["overall_status"] in ("HEALTHY", "DEGRADED")
+        assert "connectors" in data
+
+        connectors = data["connectors"]
+        assert "pacs_dicomweb" in connectors
+        assert connectors["pacs_dicomweb"]["status"] == "HEALTHY"
+        assert "backbone_hms" in connectors
+        assert "charmhealth_ehr" in connectors
+        assert connectors["charmhealth_ehr"]["capabilities"]["final_report_write"] is True
+        assert "langfuse" in connectors
+        assert "kestra" in connectors
+
+        # Outbox metrics
+        assert "outbox_backlog" in data
+        outbox = data["outbox_backlog"]
+        assert "backlog_depth" in outbox
+        assert outbox["status"] in ("HEALTHY", "DEGRADED")
+
+
+# =============================================================================
+# 9. Correlation ID Middleware Header Verification
+# =============================================================================
+
+@pytest.mark.asyncio
+async def test_correlation_id_propagated_in_response():
+    """Verify CorrelationIdMiddleware propagates X-Correlation-Id header."""
+    transport = ASGITransport(app=app)
+    test_corr_id = "corr-unique-trace-9912"
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        res = await client.get("/", headers={"X-Correlation-Id": test_corr_id})
+        assert res.status_code == 200
+        assert res.headers.get("X-Correlation-Id") == test_corr_id

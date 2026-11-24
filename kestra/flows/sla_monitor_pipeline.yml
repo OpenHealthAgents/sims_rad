@@ -1,0 +1,45 @@
+id: sla_monitor_pipeline
+namespace: sims.radiology
+
+description: >
+  Turnaround Time (TAT) and SLA Monitor pipeline. Evaluates open work items against deadlines
+  every 1 minute, flags overdue items, elevates priority to URGENT/STAT, calculates SHAP
+  explainability attribution vectors, and dispatches escalation alerts.
+
+triggers:
+  - id: cron_every_minute
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "* * * * *"
+
+tasks:
+  - id: evaluate_sla_deadlines
+    type: io.kestra.plugin.core.http.Request
+    uri: "http://api:8000/api/v1/triage/sla/evaluate"
+    method: POST
+    contentType: application/json
+
+  - id: check_breach_risks
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.evaluate_sla_deadlines.body.overdue_count > 0 || outputs.evaluate_sla_deadlines.body.approaching_count > 0 }}"
+    then:
+      - id: log_sla_risk_detected
+        type: io.kestra.plugin.core.log.Log
+        message: "SLA WARNING: {{ outputs.evaluate_sla_deadlines.body.overdue_count }} overdue items, {{ outputs.evaluate_sla_deadlines.body.approaching_count }} approaching breach. Initiating priority escalation and SHAP explainability computation."
+
+      - id: escalate_at_risk_work_item
+        type: io.kestra.plugin.core.http.Request
+        uri: "http://api:8000/api/v1/triage/sla/escalate"
+        method: POST
+        contentType: application/json
+        body:
+          work_item_id: "{{ outputs.evaluate_sla_deadlines.body.at_risk_items[0].work_item_id }}"
+          target_priority: "STAT"
+          reason: "Automated SLA Monitor: Deadline threshold exceeded. Prioritized for immediate reading."
+
+      - id: dispatch_escalation_alert
+        type: io.kestra.plugin.core.log.Log
+        message: "CRITICAL ALERT: Escalated WorkItem {{ outputs.escalate_at_risk_work_item.body.work_item_id }} to {{ outputs.escalate_at_risk_work_item.body.new_priority }}. SHAP Top Driver: {{ outputs.escalate_at_risk_work_item.body.shap_attribution.top_risk_driver }} (Breach Risk: {{ outputs.escalate_at_risk_work_item.body.shap_attribution.breach_risk_probability }})."
+    else:
+      - id: log_sla_healthy
+        type: io.kestra.plugin.core.log.Log
+        message: "SLA Turnaround Monitor: All {{ outputs.evaluate_sla_deadlines.body.total_evaluated }} open work items operating within SLA turnaround bounds."

@@ -1,0 +1,124 @@
+id: study_ingestion_pipeline
+namespace: sims.radiology
+
+description: >
+  Autonomous clinical order ingestion from BackBone HMS, authoritative RULE-01
+  patient and order reconciliation against PACS headers, exception routing for
+  discrepancies, and worklist state transition to READY.
+
+inputs:
+  - id: accession_number
+    type: STRING
+    defaults: "ACC-2026-1124-001"
+  - id: patient_mrn
+    type: STRING
+    defaults: "MRN-SIMS-001"
+  - id: patient_namespace
+    type: STRING
+    defaults: "urn:oid:sims:hospital:mrn"
+  - id: pacs_mrn
+    type: STRING
+    defaults: "MRN-SIMS-001"
+  - id: pacs_namespace
+    type: STRING
+    defaults: "urn:oid:sims:hospital:mrn"
+  - id: patient_first_name
+    type: STRING
+    defaults: "John"
+  - id: patient_last_name
+    type: STRING
+    defaults: "Doe"
+  - id: patient_dob
+    type: STRING
+    defaults: "1980-05-15"
+  - id: patient_gender
+    type: STRING
+    defaults: "male"
+  - id: modality
+    type: STRING
+    defaults: "CT"
+  - id: study_instance_uid
+    type: STRING
+    defaults: "1.2.840.10008.5.1.4.1.1.2.20261124.101"
+  - id: priority
+    type: STRING
+    defaults: "ROUTINE"
+  - id: study_description
+    type: STRING
+    defaults: "CT Head without contrast"
+
+triggers:
+  - id: order_webhook
+    type: io.kestra.plugin.core.trigger.Webhook
+    key: study-ingest-webhook-key
+
+  - id: dicom_poll_schedule
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "*/5 * * * *"
+
+tasks:
+  - id: log_ingestion_started
+    type: io.kestra.plugin.core.log.Log
+    message: "Initiating BackBone HMS ingestion for Accession {{ inputs.accession_number }} [Modality: {{ inputs.modality }}]"
+
+  - id: ingest_order_from_hms
+    type: io.kestra.plugin.core.http.Request
+    uri: "http://api:8000/api/v1/integrations/backbone/ingest"
+    method: POST
+    contentType: application/json
+    body:
+      accession_number: "{{ inputs.accession_number }}"
+      patient:
+        mrn: "{{ inputs.patient_mrn }}"
+        namespace: "{{ inputs.patient_namespace }}"
+        first_name: "{{ inputs.patient_first_name }}"
+        last_name: "{{ inputs.patient_last_name }}"
+        dob: "{{ inputs.patient_dob }}"
+        gender: "{{ inputs.patient_gender }}"
+      modality: "{{ inputs.modality }}"
+      study_instance_uid: "{{ inputs.study_instance_uid }}"
+      priority: "{{ inputs.priority }}"
+      study_description: "{{ inputs.study_description }}"
+      initial_state: "received"
+
+  - id: deterministic_reconciliation
+    type: io.kestra.plugin.core.http.Request
+    uri: "http://api:8000/api/v1/integrations/backbone/reconcile"
+    method: POST
+    contentType: application/json
+    body:
+      accession_number: "{{ inputs.accession_number }}"
+      order_mrn: "{{ inputs.patient_mrn }}"
+      order_namespace: "{{ inputs.patient_namespace }}"
+      pacs_mrn: "{{ inputs.pacs_mrn }}"
+      pacs_namespace: "{{ inputs.pacs_namespace }}"
+      study_id: "{{ outputs.ingest_order_from_hms.body.study_id }}"
+      work_item_id: "{{ outputs.ingest_order_from_hms.body.work_item_id }}"
+
+  - id: branch_reconciliation_outcome
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.deterministic_reconciliation.body.is_reconciled == false }}"
+    then:
+      - id: flag_and_push_to_exception_queue
+        type: io.kestra.plugin.core.http.Request
+        uri: "http://api:8000/api/v1/integrations/backbone/reconciliation/flag"
+        method: POST
+        contentType: application/json
+        body:
+          study_id: "{{ outputs.ingest_order_from_hms.body.study_id }}"
+          work_item_id: "{{ outputs.ingest_order_from_hms.body.work_item_id }}"
+          reason: "Reconciliation discrepancy detected: {{ outputs.deterministic_reconciliation.body.discrepancy_reasons }}"
+
+      - id: alert_reconciliation_exception
+        type: io.kestra.plugin.core.log.Log
+        message: "ALERT [RECONCILIATION EXCEPTION]: Study {{ outputs.ingest_order_from_hms.body.study_id }} (Accession {{ inputs.accession_number }}) flagged with discrepancies! Clinical writeback blocked. Pushed to human reconciliation queue."
+    else:
+      - id: update_worklist_to_ready
+        type: io.kestra.plugin.core.http.Request
+        uri: "http://api:8000/api/v1/integrations/worklist/{{ outputs.ingest_order_from_hms.body.work_item_id }}/ready"
+        method: POST
+        contentType: application/json
+
+      - id: log_clean_reconciliation
+        type: io.kestra.plugin.core.log.Log
+        message: "Clean reconciliation verified for Study {{ outputs.ingest_order_from_hms.body.study_id }}. Work item {{ outputs.ingest_order_from_hms.body.work_item_id }} transitioned to READY state."

@@ -1,0 +1,40 @@
+id: dicom_ingestion_and_triage
+namespace: sims.radiology
+
+description: >
+  Autonomous DICOM exam ingestion, Deep Agents inference, NeMo safety rail verification,
+  and emergency radiologist triage escalation.
+
+inputs:
+  - id: study_uid
+    type: STRING
+    defaults: "1.2.840.10008.5.1.4.1.1.2.20261124.001"
+  - id: patient_id
+    type: STRING
+    defaults: "SIMS-PATIENT-001"
+  - id: modality
+    type: STRING
+    defaults: "CT"
+
+tasks:
+  - id: log_study_received
+    type: io.kestra.plugin.core.log.Log
+    message: "Ingesting DICOM study {{ inputs.study_uid }} for patient {{ inputs.patient_id }} [Modality: {{ inputs.modality }}]"
+
+  - id: trigger_agentic_triage
+    type: io.kestra.plugin.core.http.Request
+    uri: "http://api:8000/api/v1/triage/{{ inputs.study_uid }}/run"
+    method: POST
+    contentType: application/json
+
+  - id: evaluate_triage_escalation
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.trigger_agentic_triage.body.triage_priority == 'STAT' }}"
+    then:
+      - id: notify_critical_findings
+        type: io.kestra.plugin.core.log.Log
+        message: "ALERT [STAT PRIORITY]: Critical findings detected in study {{ inputs.study_uid }}! Immediate notification dispatched to duty radiologist."
+    else:
+      - id: log_routine_processing
+        type: io.kestra.plugin.core.log.Log
+        message: "Study {{ inputs.study_uid }} categorized as {{ outputs.trigger_agentic_triage.body.triage_priority }}. Staged for routine worklist."

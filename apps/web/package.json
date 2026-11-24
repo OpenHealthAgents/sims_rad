@@ -1,0 +1,25 @@
+{
+  "name": "@sims/radiology-web",
+  "version": "0.1.0",
+  "description": "SIMS Radiology AI Operating Platform Web Frontend with A2UI Components",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@a2ui/lit": "^0.16.0",
+    "@a2ui/web_core": "^0.16.1",
+    "@lit-labs/signals": "^0.3.0",
+    "@lit/context": "^1.1.6",
+    "lit": "^3.3.3",
+    "signal-utils": "^0.21.1",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.3",
+    "vite": "^6.0.0"
+  }
+}

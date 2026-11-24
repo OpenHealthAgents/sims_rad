@@ -1,0 +1,331 @@
+services:
+  # ============================================================================
+  # 1. PostgreSQL 16 - Relational Persistence & Transactional Outbox Store
+  # ============================================================================
+  postgres:
+    image: postgres:16-alpine
+    container_name: sims_postgres_prod
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-sims_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-sims_secret_password}
+      POSTGRES_DB: ${POSTGRES_DB:-sims_radiology}
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - sims_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2048M
+        reservations:
+          cpus: "0.5"
+          memory: 512M
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    networks:
+      - data-net
+
+  # ============================================================================
+  # 2. Redis 7 - Celery Task Broker & In-Memory Cache
+  # ============================================================================
+  redis:
+    image: redis:7-alpine
+    container_name: sims_redis_prod
+    restart: unless-stopped
+    command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru
+    volumes:
+      - sims_redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+        reservations:
+          cpus: "0.2"
+          memory: 128M
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    networks:
+      - backend-net
+      - data-net
+
+  # ============================================================================
+  # 3. FastAPI Core Application Service (REST API & Agent Streaming)
+  # ============================================================================
+  api:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    container_name: sims_api_prod
+    restart: unless-stopped
+    command: uvicorn apps.api.src.main:app --host 0.0.0.0 --port 8000 --workers 4
+    environment:
+      PROJECT_NAME: "${PROJECT_NAME:-SIMS Radiology AI Operating Agentic Platform}"
+      ENVIRONMENT: "production"
+      API_V1_STR: "/api/v1"
+      POSTGRES_SERVER: "postgres"
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: "${POSTGRES_USER:-sims_user}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-sims_secret_password}"
+      POSTGRES_DB: "${POSTGRES_DB:-sims_radiology}"
+      REDIS_HOST: "redis"
+      REDIS_PORT: 6379
+      CELERY_BROKER_URL: "redis://redis:6379/0"
+      CELERY_RESULT_BACKEND: "redis://redis:6379/1"
+      LANGFUSE_HOST: "http://langfuse:3000"
+      LANGFUSE_PUBLIC_KEY: "${LANGFUSE_PUBLIC_KEY:-pk-lf-prod-sims-001}"
+      LANGFUSE_SECRET_KEY: "${LANGFUSE_SECRET_KEY:-sk-lf-prod-sims-001}"
+      KESTRA_API_HOST: "http://kestra:8080"
+      KESTRA_NAMESPACE: "sims.radiology"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2048M
+        reservations:
+          cpus: "0.5"
+          memory: 512M
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    networks:
+      - frontend-net
+      - backend-net
+      - data-net
+
+  # ============================================================================
+  # 4. Celery Task Worker - Transactional Outbox & Background Processing
+  # ============================================================================
+  celery_worker:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    container_name: sims_celery_worker_prod
+    restart: unless-stopped
+    command: celery -A core.infrastructure.celery.app.celery_app worker --loglevel=info -Q default,outbox,high_priority --concurrency=4
+    environment:
+      ENVIRONMENT: "production"
+      POSTGRES_SERVER: "postgres"
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: "${POSTGRES_USER:-sims_user}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-sims_secret_password}"
+      POSTGRES_DB: "${POSTGRES_DB:-sims_radiology}"
+      REDIS_HOST: "redis"
+      REDIS_PORT: 6379
+      CELERY_BROKER_URL: "redis://redis:6379/0"
+      CELERY_RESULT_BACKEND: "redis://redis:6379/1"
+      KESTRA_API_HOST: "http://kestra:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A core.infrastructure.celery.app.celery_app inspect ping -d celery@$$HOSTNAME || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2048M
+        reservations:
+          cpus: "0.5"
+          memory: 512M
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    networks:
+      - backend-net
+      - data-net
+
+  # ============================================================================
+  # 5. Nginx Production Web Server (SPA, A2UI Engine, SSE Reverse Proxy)
+  # ============================================================================
+  web:
+    build:
+      context: apps/web
+      dockerfile: Dockerfile
+    container_name: sims_web_prod
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1:80/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+        reservations:
+          cpus: "0.2"
+          memory: 64M
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    networks:
+      - frontend-net
+
+  # ============================================================================
+  # 6. Kestra Workflow Orchestrator (Data Integration & SLA Monitoring)
+  # ============================================================================
+  kestra:
+    image: kestra/kestra:latest
+    container_name: sims_kestra_prod
+    restart: unless-stopped
+    command: server standalone
+    ports:
+      - "8080:8080"
+    volumes:
+      - sims_kestra_data:/app/storage
+      - ./kestra/flows:/app/flows:ro
+    environment:
+      KESTRA_CONFIGURATION: |
+        kestra:
+          storage:
+            type: local
+            local:
+              base-path: "/app/storage"
+          repository:
+            type: memory
+          queue:
+            type: memory
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8080/api/v1/health || wget -q -O - http://localhost:8080/api/v1/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2048M
+        reservations:
+          cpus: "0.5"
+          memory: 512M
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    networks:
+      - backend-net
+      - data-net
+
+  # ============================================================================
+  # 7. Langfuse Observability & LLM-as-a-Judge Evaluation Server
+  # ============================================================================
+  langfuse:
+    image: langfuse/langfuse:latest
+    container_name: sims_langfuse_prod
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      DATABASE_URL: "postgresql://${POSTGRES_USER:-sims_user}:${POSTGRES_PASSWORD:-sims_secret_password}@postgres:5432/${POSTGRES_DB:-sims_radiology}"
+      NEXTAUTH_SECRET: "${NEXTAUTH_SECRET:-sims_nextauth_secret_prod_32char_minimum_entropy}"
+      SALT: "${SALT:-sims_salt_key_radiology_prod_secure}"
+      ENCRYPTION_KEY: "${ENCRYPTION_KEY:-0000000000000000000000000000000000000000000000000000000000000000}"
+      NEXTAUTH_URL: "http://localhost:3000"
+      TELEMETRY_ENABLED: "false"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://localhost:3000/api/public/health || curl -f http://localhost:3000/api/public/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2048M
+        reservations:
+          cpus: "0.5"
+          memory: 512M
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    networks:
+      - backend-net
+      - data-net
+
+# ============================================================================
+# Persistent Named Volumes
+# ============================================================================
+volumes:
+  sims_postgres_data:
+    name: sims_postgres_prod_data
+  sims_redis_data:
+    name: sims_redis_prod_data
+  sims_kestra_data:
+    name: sims_kestra_prod_data
+
+# ============================================================================
+# Internal Network Segmentation
+# - frontend-net: Perimeter reverse proxy (web) & API bridge
+# - backend-net: Inter-service messaging (api, worker, kestra, langfuse, redis)
+# - data-net: Secure database persistence tier (postgres, redis, apps)
+# ============================================================================
+networks:
+  frontend-net:
+    name: sims_frontend_net
+    driver: bridge
+  backend-net:
+    name: sims_backend_net
+    driver: bridge
+  data-net:
+    name: sims_data_net
+    driver: bridge

@@ -1,0 +1,31 @@
+id: report_delivery_retry
+namespace: sims.radiology
+
+description: >
+  Scheduled retry pipeline for CharmHealth EHR and external clinical report deliveries
+  from the Transactional Outbox with exponential backoff.
+
+triggers:
+  - id: cron_every_5_minutes
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "*/5 * * * *"
+
+tasks:
+  - id: log_retry_cycle_start
+    type: io.kestra.plugin.core.log.Log
+    message: "Starting report delivery retry cycle for pending Transactional Outbox events."
+
+  - id: flush_outbox_deliveries
+    type: io.kestra.plugin.core.http.Request
+    uri: "http://api:8000/api/v1/integrations/charmhealth/retry-deliveries"
+    method: POST
+    contentType: application/json
+    retry:
+      type: exponential
+      maxAttempts: 3
+      interval: PT5S
+      maxInterval: PT60S
+
+  - id: log_delivery_results
+    type: io.kestra.plugin.core.log.Log
+    message: "Report delivery retry complete. Processed: {{ outputs.flush_outbox_deliveries.body.processed_count }}, Status: {{ outputs.flush_outbox_deliveries.body.status }} at {{ outputs.flush_outbox_deliveries.body.timestamp }}."
