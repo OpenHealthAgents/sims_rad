@@ -1,8 +1,22 @@
 """
-Transactional Outbox Worker using Celery Task Runner.
-Polls and publishes unprocessed outbox_events to downstream interfaces
-(Kestra workflow pipelines and external EHR delivery systems).
-Leverages patterns from reference_repos/celery and reference_repos/kestra.
+Transactional Outbox Worker using Celery Background Task Runner.
+
+Pattern & Architectural Rationale:
+    In distributed healthcare architectures, dual writes between a relational database
+    (PostgreSQL) and external messaging systems (Kestra, RabbitMQ/Redis, EHR HTTP endpoints)
+    suffer from partial failure modes where one write succeeds while the other fails.
+    
+    The Transactional Outbox pattern eliminates dual-write inconsistencies by writing domain
+    events to the `outbox_events` table within the exact same ACID database transaction as the
+    entity mutation. A decoupled background task runner then polls the outbox and guarantees
+    at-least-once delivery to downstream consumers.
+
+Concurrency & Scalability Design:
+    - `with_for_update(skip_locked=True)`: Ensures multiple worker instances can poll the table
+      concurrently without blocking each other or processing duplicate events.
+    - Celery task `persistence.process_outbox_events_task` executes with automatic retry backoff.
+    - Idempotent Downstream Handling: Consumers are expected to handle duplicate event keys
+      gracefully via unique event IDs.
 """
 import asyncio
 from datetime import datetime, timezone
@@ -20,14 +34,22 @@ logger = logging.getLogger("sims_radiology.outbox_worker")
 
 
 class DownstreamDispatcher:
-    """Dispatches outbox events to appropriate downstream targets."""
+    """
+    Dispatches outbox events to appropriate downstream targets based on aggregate type.
+    """
 
     @classmethod
     async def dispatch(cls, event: OutboxEventModel) -> bool:
         """
         Route event to appropriate downstream interface:
-        - Work item and study events -> Kestra flows
-        - Report release events -> EHR / HL7 delivery
+            - Work item and study events -> Kestra flows (`dicom_ingestion_and_triage`)
+            - Report release events -> CharmHealth EHR / FHIR delivery channel
+
+        Parameters:
+            event (OutboxEventModel): Outbox database record containing payload and metadata.
+
+        Returns:
+            bool: True if event was acknowledged by downstream interface, False otherwise.
         """
         try:
             logger.info(
@@ -60,8 +82,19 @@ class DownstreamDispatcher:
 async def process_outbox_batch(batch_size: int = 50, session: Optional[AsyncSession] = None) -> int:
     """
     Core polling loop for the Transactional Outbox pattern.
-    Fetches up to `batch_size` pending events, dispatches them, and marks them processed.
-    Returns: Number of events successfully processed.
+
+    Fetches up to `batch_size` pending events, dispatches them via `DownstreamDispatcher`,
+    and marks them processed with `processed_at = UTC NOW`.
+
+    Parameters:
+        batch_size (int): Maximum number of unprocessed events to claim in one batch (default 50).
+        session (Optional[AsyncSession]): Optional active database session; if None, creates a fresh session.
+
+    Returns:
+        int: Total number of events successfully published and committed.
+
+    Concurrency Details:
+        Uses `with_for_update(skip_locked=True)` so concurrent workers safely skip already-claimed rows.
     """
     own_session = False
     if session is None:
@@ -105,6 +138,15 @@ async def process_outbox_batch(batch_size: int = 50, session: Optional[AsyncSess
 def process_outbox_events_task(self, batch_size: int = 50) -> Dict[str, Any]:
     """
     Celery background worker task for publishing pending outbox events.
+
+    Parameters:
+        batch_size (int): Batch size passed to `process_outbox_batch`.
+
+    Returns:
+        Dict[str, Any]: Status dictionary containing event processing metrics.
+
+    Retry Policy:
+        Retries up to 3 times with a 5-second countdown on unhandled exceptions.
     """
     try:
         try:
